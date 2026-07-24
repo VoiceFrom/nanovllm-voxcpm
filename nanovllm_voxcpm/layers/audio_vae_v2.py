@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from torch import nn
 from torch.nn.utils import weight_norm
 
+from nanovllm_voxcpm.layers.streaming_vae import BatchedStreamingVAEDecoder
+
 
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
@@ -400,6 +402,9 @@ class AudioVAEV2(nn.Module):
     @torch.inference_mode()
     def decode(self, z: torch.Tensor, sr_cond: torch.Tensor | None = None):
         return self.decoder(z, sr_cond)
+
+    def streaming_decoder(self) -> BatchedStreamingVAEDecoder:
+        return BatchedStreamingVAEDecoder(self, CausalConv1d, CausalTransposeConv1d)
 
     @torch.inference_mode()
     def encode(self, audio_data: torch.Tensor, sample_rate: int):

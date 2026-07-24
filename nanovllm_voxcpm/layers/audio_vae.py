@@ -7,6 +7,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
+from nanovllm_voxcpm.layers.streaming_vae import BatchedStreamingVAEDecoder
+
 
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
@@ -344,6 +346,9 @@ class AudioVAE(nn.Module):
                 Decoded audio data.
         """
         return self.decoder(z)
+
+    def streaming_decoder(self) -> BatchedStreamingVAEDecoder:
+        return BatchedStreamingVAEDecoder(self, CausalConv1d, CausalTransposeConv1d)
 
     @torch.inference_mode()
     def encode(self, audio_data: torch.Tensor, sample_rate: int):

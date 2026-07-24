@@ -56,6 +56,7 @@ class VoxCPM2Runner(BaseModelRunner):
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
+        self.vae_streaming_decoder = self.vae.streaming_decoder()
         torch.set_default_dtype(torch.bfloat16)
 
     def make_dummy_inputs(self, batch_size: int, length: int) -> dict[str, torch.Tensor]:
@@ -137,31 +138,61 @@ class VoxCPM2Runner(BaseModelRunner):
         outputs = self.run_model(inputs, is_prefill)
         latents = outputs["latents"]
 
-        pad_lengths = [
-            seq.custom_payload.padding_decode.shape[0] if seq.custom_payload.padding_decode is not None else 0
-            for seq in seqs
-        ]
-
-        max_pad_decode = max(pad_lengths) + self.patch_size
-        vae_decoder_inputs = torch.zeros(len(seqs), max_pad_decode, self.feat_dim, dtype=torch.float32, device="cuda")
-        for i, seq in enumerate(seqs):
-            pad_len = pad_lengths[i]
-            if pad_len > 0:
-                vae_decoder_inputs[i, :pad_len] = torch.from_numpy(seq.custom_payload.padding_decode).cuda(
-                    non_blocking=True
+        if all(getattr(seq, "seq_id", None) is not None for seq in seqs):
+            initial_contexts = []
+            for seq in seqs:
+                padding_decode = seq.custom_payload.padding_decode
+                initial_contexts.append(
+                    None
+                    if padding_decode is None
+                    else torch.from_numpy(padding_decode)
+                    .to(device="cuda", dtype=torch.float32, non_blocking=True)
+                    .transpose(0, 1)
+                    .unsqueeze(0)
                 )
-            vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(torch.float32)
-
-        vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :].cpu().numpy()
-        stop_flag = outputs["stop_flag"].cpu().tolist()
-        ret_waveforms = []
-        for i, pad_len in enumerate(pad_lengths):
-            ret_waveforms.append(
-                vae_decoder_outputs[
-                    i,
-                    pad_len * self.vae.decoder_chunk_size : (pad_len + self.patch_size) * self.vae.decoder_chunk_size,
-                ]
+            vae_decoder_outputs = (
+                self.vae_streaming_decoder.decode_chunks(
+                    latents.to(torch.float32).permute(0, 2, 1),
+                    [seq.seq_id for seq in seqs],
+                    initial_contexts,
+                )[:, 0, :]
+                .cpu()
+                .numpy()
             )
+            ret_waveforms = [vae_decoder_outputs[i] for i in range(len(seqs))]
+        else:
+            pad_lengths = [
+                seq.custom_payload.padding_decode.shape[0] if seq.custom_payload.padding_decode is not None else 0
+                for seq in seqs
+            ]
+            max_pad_decode = max(pad_lengths) + self.patch_size
+            vae_decoder_inputs = torch.zeros(
+                len(seqs),
+                max_pad_decode,
+                self.feat_dim,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            for i, seq in enumerate(seqs):
+                pad_len = pad_lengths[i]
+                if pad_len > 0:
+                    vae_decoder_inputs[i, :pad_len] = torch.from_numpy(seq.custom_payload.padding_decode).cuda(
+                        non_blocking=True
+                    )
+                vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(torch.float32)
+            vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :].cpu().numpy()
+            ret_waveforms = []
+            for i, pad_len in enumerate(pad_lengths):
+                ret_waveforms.append(
+                    vae_decoder_outputs[
+                        i,
+                        pad_len
+                        * self.vae.decoder_chunk_size : (pad_len + self.patch_size)
+                        * self.vae.decoder_chunk_size,
+                    ]
+                )
+
+        stop_flag = outputs["stop_flag"].cpu().tolist()
 
         np_latents = latents.to(torch.float32).cpu().numpy()
         return [

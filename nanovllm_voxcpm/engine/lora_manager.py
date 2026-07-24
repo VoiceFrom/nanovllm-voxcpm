@@ -149,6 +149,10 @@ def build_lora_context_from_batch_plan(plan: LoRABatchPlan) -> LoRAContext:
             token_to_slot=token_to_slot_tensor,
             no_lora_flag=True,
             num_active_loras=0,
+            host_token_to_slot=plan.token_to_slot,
+            host_token_indices_sorted_by_slot=plan.token_indices_sorted_by_slot,
+            host_active_slot_ids=plan.active_slot_ids,
+            host_num_tokens_per_slot=plan.num_tokens_per_slot,
         )
 
     (
@@ -173,6 +177,10 @@ def build_lora_context_from_batch_plan(plan: LoRABatchPlan) -> LoRAContext:
         slot_start_offsets=slot_start_offsets_tensor,
         no_lora_flag=False,
         num_active_loras=len(plan.active_slot_ids),
+        host_token_to_slot=plan.token_to_slot,
+        host_token_indices_sorted_by_slot=plan.token_indices_sorted_by_slot,
+        host_active_slot_ids=plan.active_slot_ids,
+        host_num_tokens_per_slot=plan.num_tokens_per_slot,
     )
 
 

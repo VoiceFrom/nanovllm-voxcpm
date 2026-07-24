@@ -601,7 +601,7 @@ class VoxCPM2Model(nn.Module):
         self.stop_actn = nn.SiLU()
         self.stop_head = nn.Linear(config.lm_config.hidden_size, 2, bias=False)
 
-    def forward(
+    def forward_backbone(
         self,
         positions: torch.Tensor,
         text_tokens: torch.Tensor,
@@ -638,12 +638,61 @@ class VoxCPM2Model(nn.Module):
             prefix_feat_cond = feat
 
         dit_hidden = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(ralm_hidden)], dim=-1)
-        pred_feat = self.feat_decoder(
-            mu=dit_hidden,
-            cond=prefix_feat_cond.transpose(1, 2).contiguous(),
+        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
+        return (
+            {
+                "mu": dit_hidden,
+                "cond": prefix_feat_cond.transpose(1, 2).contiguous(),
+                "temperature": temperature,
+                "cfg_value": cfg_value,
+                "z_noise": z_noise,
+            },
+            {"stop_flag": stop_flag},
+        )
+
+    def forward_diffusion(
+        self,
+        mu: torch.Tensor,
+        cond: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.feat_decoder(
+            mu=mu,
+            cond=cond,
             temperature=temperature,
             cfg_value=cfg_value,
             z_noise=z_noise,
         ).transpose(1, 2)
-        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
-        return {"latents": pred_feat, "stop_flag": stop_flag}
+
+    def make_dummy_diffusion_inputs(self, batch_size: int) -> dict[str, torch.Tensor]:
+        return {
+            "mu": torch.zeros(batch_size, 2 * self.config.dit_config.hidden_dim),
+            "cond": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+            "temperature": torch.zeros(batch_size),
+            "cfg_value": torch.zeros(batch_size),
+            "z_noise": torch.zeros(batch_size, self.feat_dim, self.patch_size),
+        }
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        text_tokens: torch.Tensor,
+        feat: torch.Tensor,
+        feat_mask: torch.Tensor,
+        temperature: torch.Tensor,
+        cfg_value: torch.Tensor,
+        z_noise: torch.Tensor | None = None,
+    ):
+        diffusion_inputs, outputs = self.forward_backbone(
+            positions=positions,
+            text_tokens=text_tokens,
+            feat=feat,
+            feat_mask=feat_mask,
+            temperature=temperature,
+            cfg_value=cfg_value,
+            z_noise=z_noise,
+        )
+        outputs["latents"] = self.forward_diffusion(**diffusion_inputs)
+        return outputs

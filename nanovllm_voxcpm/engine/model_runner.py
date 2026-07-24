@@ -96,6 +96,7 @@ from nanovllm_voxcpm.utils.context import (
     LM_LORA_DOMAIN,
     PROJ_LORA_DOMAIN,
     LoRAContext,
+    build_lora_context_from_token_to_slot,
     get_context,
     get_lora_context,
     reset_all_contexts,
@@ -139,6 +140,7 @@ class RunnerTask(Generic[PlayloadType]):
         block_size: int,
         custom_payload: PlayloadType = None,
         adapter_id: int | None = None,
+        seq_id: str | None = None,
     ):
         self.block_table = block_table
         self.seq_length = seq_length
@@ -146,6 +148,7 @@ class RunnerTask(Generic[PlayloadType]):
         self.custom_payload = custom_payload
         self.block_size = block_size
         self.adapter_id = adapter_id
+        self.seq_id = seq_id
 
     @property
     def num_blocks(self):
@@ -175,9 +178,20 @@ def expand_dit_lora_slots(
     sample_to_slot: list[int],
     sequence_length: int,
     cfg_branches: int,
+    padded_batch_size: int | None = None,
 ) -> list[int]:
-    """Expand sample slots in the branch-major order used by CFG."""
-    return [slot for _ in range(cfg_branches) for slot in sample_to_slot for _ in range(sequence_length)]
+    """Expand sample-level slots in the branch-major order used by CFG.
+
+    Diffusion constructs its estimator batch as all positive samples followed
+    by all negative samples. CUDA graph batch padding must therefore be
+    inserted at the end of each CFG branch rather than once at the end.
+    """
+    batch_size = len(sample_to_slot)
+    padded_batch_size = batch_size if padded_batch_size is None else padded_batch_size
+    if padded_batch_size < batch_size:
+        raise ValueError("padded_batch_size cannot be smaller than the real batch size")
+    padded_slots = sample_to_slot + [-1] * (padded_batch_size - batch_size)
+    return [slot for _ in range(cfg_branches) for slot in padded_slots for _ in range(sequence_length)]
 
 
 def _clear_lora_slot_modules(modules, slot_id: int, module_names: list[str] | None = None) -> None:
@@ -323,16 +337,22 @@ class BaseModelRunner:
         sample_to_slot = [
             plan.adapter_to_slot.get(adapter_id, -1) if adapter_id is not None else -1 for adapter_id in adapter_ids
         ]
+        padded_batch_size = len(sample_to_slot)
+        if not getattr(self, "enforce_eager", True) and hasattr(self, "graph_bs"):
+            padded_batch_size = next(
+                (graph_bs for graph_bs in self.graph_bs if graph_bs >= len(sample_to_slot)),
+                len(sample_to_slot),
+            )
+        dit_token_to_slot = expand_dit_lora_slots(
+            sample_to_slot,
+            sequence_length=self._dit_lora_sequence_length(),
+            cfg_branches=self.cfg_branches,
+            padded_batch_size=padded_batch_size,
+        )
         return {
             LM_LORA_DOMAIN: build_lora_context_from_batch_plan(plan),
             PROJ_LORA_DOMAIN: build_lora_context_from_slot_list(sample_to_slot),
-            DIT_LORA_DOMAIN: build_lora_context_from_slot_list(
-                expand_dit_lora_slots(
-                    sample_to_slot,
-                    sequence_length=self._dit_lora_sequence_length(),
-                    cfg_branches=self.cfg_branches,
-                )
-            ),
+            DIT_LORA_DOMAIN: build_lora_context_from_slot_list(dit_token_to_slot),
         }
 
     def _lora_model_modules(self) -> dict[str, torch.nn.Module]:
@@ -401,6 +421,11 @@ class BaseModelRunner:
     def lora_on_sequence_finished(self, adapter_id: int | None, was_running: bool) -> None:
         self.lora_runtime.on_sequence_finished(adapter_id, was_running=was_running)
 
+    def release_sequence_state(self, seq_id: str) -> None:
+        vae_decoder = getattr(self, "vae_streaming_decoder", None)
+        if vae_decoder is not None:
+            vae_decoder.release(seq_id)
+
     def _load_lora_slot(self, slot_id: int, payload: LoRAModelPayload) -> None:
         modules = self._lora_model_modules()
         # Only clear modules that the previous occupant of this slot actually
@@ -412,7 +437,10 @@ class BaseModelRunner:
             slot_modules = {}
             self._lora_slot_modules = slot_modules
         previously_loaded = slot_modules.get(slot_id)
-        _clear_lora_slot_modules(modules, slot_id, module_names=previously_loaded)
+        if previously_loaded is not None:
+            incoming_modules = set(payload.modules)
+            removed_modules = [name for name in previously_loaded if name not in incoming_modules]
+            _clear_lora_slot_modules(modules, slot_id, module_names=removed_modules)
         for module_name, module_payload in payload.modules.items():
             try:
                 module = modules[module_name]
@@ -578,6 +606,8 @@ class BaseModelRunner:
             dist.destroy_process_group()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "prefill_diffusion_graphs"):
+                del self.prefill_diffusion_graphs, self.prefill_diffusion_graph_vars
         torch.cuda.synchronize()
 
     def loop(self):
@@ -730,13 +760,55 @@ class BaseModelRunner:
             set_lora_context(lora_context, domain=domain)
         return positions
 
-    def _make_graph_domain_buffers(self, max_rows: int, max_lora_buckets: int) -> dict[str, torch.Tensor]:
+    def _make_graph_domain_buffers(self, max_rows: int, max_lora_buckets: int) -> dict:
+        sizes = (
+            max_rows,
+            max_rows,
+            max_lora_buckets,
+            max_lora_buckets,
+            max_lora_buckets + 1,
+        )
+        total_size = sum(sizes)
+        packed = torch.empty(total_size, dtype=torch.int32)
+        host_staging = torch.empty(total_size, dtype=torch.int32, device="cpu", pin_memory=True)
+        offsets = [0]
+        for size in sizes:
+            offsets.append(offsets[-1] + size)
+
+        def views(buffer: torch.Tensor):
+            return (
+                buffer[offsets[0] : offsets[1]],
+                buffer[offsets[1] : offsets[2]],
+                buffer[offsets[2] : offsets[3]],
+                buffer[offsets[3] : offsets[4]],
+                buffer[offsets[4] : offsets[5]],
+            )
+
+        token_to_slot, token_indices, active_slot_ids, num_tokens, slot_offsets = views(packed)
+        host_token_to_slot, host_token_indices, host_active_slot_ids, host_num_tokens, host_slot_offsets = views(
+            host_staging
+        )
+        host_token_to_slot.fill_(-1)
+        host_token_indices.copy_(torch.arange(max_rows, dtype=torch.int32))
+        host_active_slot_ids.copy_(torch.arange(-1, max_lora_buckets - 1, dtype=torch.int32))
+        host_num_tokens.zero_()
+        host_slot_offsets.zero_()
+        packed.copy_(host_staging, non_blocking=True)
         return {
-            "token_to_slot": torch.full((max_rows,), -1, dtype=torch.int32),
-            "token_indices_sorted_by_slot": torch.arange(max_rows, dtype=torch.int32),
-            "active_slot_ids": torch.arange(-1, max_lora_buckets - 1, dtype=torch.int32),
-            "num_tokens_per_slot": torch.zeros(max_lora_buckets, dtype=torch.int32),
-            "slot_start_offsets": torch.zeros(max_lora_buckets + 1, dtype=torch.int32),
+            "packed": packed,
+            "host_staging": host_staging,
+            "copy_event": torch.cuda.Event(),
+            "copy_pending": False,
+            "token_to_slot": token_to_slot,
+            "token_indices_sorted_by_slot": token_indices,
+            "active_slot_ids": active_slot_ids,
+            "num_tokens_per_slot": num_tokens,
+            "slot_start_offsets": slot_offsets,
+            "host_token_to_slot": host_token_to_slot,
+            "host_token_indices_sorted_by_slot": host_token_indices,
+            "host_active_slot_ids": host_active_slot_ids,
+            "host_num_tokens_per_slot": host_num_tokens,
+            "host_slot_start_offsets": host_slot_offsets,
         }
 
     def _copy_lora_domain_to_graph_vars(
@@ -754,15 +826,9 @@ class BaseModelRunner:
         metadata shuffling, dominating the LoRA RTF regression.
 
         We now precompute the final-form slices on CPU (int32), pack them into
-        one pinned buffer, and issue a single H2D copy — plus a single cumsum
-        on GPU for ``slot_start_offsets`` (we still derive it from
-        ``num_tokens_per_slot`` on-device to keep the final tensor consistent
-        with what kernels read).
-
-        The ``no_lora_flag`` case is specialised to a tiny ``fill_(-1)`` on
-        ``token_to_slot`` — all other buffers were preallocated to the correct
-        sentinel state at capture time and kernels short-circuit on
-        ``no_lora`` anyway.
+        one pinned buffer, and issue a single H2D copy for the entire domain.
+        The same packed transfer restores the sentinel state for batches
+        without active LoRA adapters.
         """
         domain_vars = graph_vars["lora_domains"][domain]
         token_to_slot_buf: torch.Tensor = domain_vars["token_to_slot"]
@@ -771,6 +837,41 @@ class BaseModelRunner:
         slot_start_buf: torch.Tensor = domain_vars["slot_start_offsets"]
 
         token_count = 0 if context.token_to_slot is None else context.token_to_slot.size(0)
+        has_host_metadata = context.host_token_to_slot is not None
+        if "host_staging" in domain_vars and (context.no_lora_flag or has_host_metadata):
+            if domain_vars["copy_pending"]:
+                domain_vars["copy_event"].synchronize()
+
+            host_token_to_slot = domain_vars["host_token_to_slot"]
+            host_token_indices = domain_vars["host_token_indices_sorted_by_slot"]
+            host_num_tokens = domain_vars["host_num_tokens_per_slot"]
+            host_slot_offsets = domain_vars["host_slot_start_offsets"]
+            host_token_to_slot.fill_(-1)
+            host_num_tokens.zero_()
+            host_slot_offsets.zero_()
+
+            if not context.no_lora_flag:
+                host_slots = context.host_token_to_slot or []
+                host_indices = context.host_token_indices_sorted_by_slot or []
+                host_active_ids = context.host_active_slot_ids or []
+                host_counts = context.host_num_tokens_per_slot or []
+                if len(host_slots) > host_token_to_slot.numel():
+                    raise ValueError("LoRA token metadata exceeds captured CUDA graph capacity")
+                host_token_to_slot[: len(host_slots)].copy_(torch.tensor(host_slots, dtype=torch.int32))
+                host_token_indices[: len(host_indices)].copy_(torch.tensor(host_indices, dtype=torch.int32))
+                fixed_counts = [0] * host_num_tokens.numel()
+                for slot_id, count in zip(host_active_ids, host_counts):
+                    fixed_counts[slot_id + 1] = count
+                fixed_offsets = [0]
+                for count in fixed_counts:
+                    fixed_offsets.append(fixed_offsets[-1] + count)
+                host_num_tokens.copy_(torch.tensor(fixed_counts, dtype=torch.int32))
+                host_slot_offsets.copy_(torch.tensor(fixed_offsets, dtype=torch.int32))
+
+            domain_vars["packed"].copy_(domain_vars["host_staging"], non_blocking=True)
+            domain_vars["copy_event"].record()
+            domain_vars["copy_pending"] = True
+            return
 
         if context.no_lora_flag or context.token_to_slot is None:
             # Kernels bail out on no_lora; we only need token_to_slot to be
@@ -811,25 +912,27 @@ class BaseModelRunner:
         slot_start_buf[0] = 0
         torch.cumsum(num_tokens_buf, dim=0, out=slot_start_buf[1:])
 
+    def _set_graph_lora_context(self, graph_vars: dict, domain: str, context: LoRAContext) -> None:
+        self._copy_lora_domain_to_graph_vars(graph_vars, domain, context)
+        domain_vars = graph_vars["lora_domains"][domain]
+        token_count = 0 if context.token_to_slot is None else context.token_to_slot.size(0)
+        num_lora_buckets = domain_vars["active_slot_ids"].size(0)
+        set_lora_context(
+            LoRAContext(
+                token_to_slot=domain_vars["token_to_slot"][:token_count],
+                token_indices_sorted_by_slot=domain_vars["token_indices_sorted_by_slot"][:token_count],
+                active_slot_ids=domain_vars["active_slot_ids"],
+                num_tokens_per_slot=domain_vars["num_tokens_per_slot"],
+                slot_start_offsets=domain_vars["slot_start_offsets"],
+                no_lora_flag=context.no_lora_flag,
+                num_active_loras=num_lora_buckets,
+            ),
+            domain=domain,
+        )
+
     def _set_graph_lora_contexts(self, graph_vars: dict, contexts: dict[str, LoRAContext]) -> None:
         for domain in LORA_DOMAINS:
-            context = contexts[domain]
-            self._copy_lora_domain_to_graph_vars(graph_vars, domain, context)
-            domain_vars = graph_vars["lora_domains"][domain]
-            token_count = 0 if context.token_to_slot is None else context.token_to_slot.size(0)
-            num_lora_buckets = domain_vars["active_slot_ids"].size(0)
-            set_lora_context(
-                LoRAContext(
-                    token_to_slot=domain_vars["token_to_slot"][:token_count],
-                    token_indices_sorted_by_slot=domain_vars["token_indices_sorted_by_slot"][:token_count],
-                    active_slot_ids=domain_vars["active_slot_ids"],
-                    num_tokens_per_slot=domain_vars["num_tokens_per_slot"],
-                    slot_start_offsets=domain_vars["slot_start_offsets"],
-                    no_lora_flag=context.no_lora_flag,
-                    num_active_loras=num_lora_buckets,
-                ),
-                domain=domain,
-            )
+            self._set_graph_lora_context(graph_vars, domain, contexts[domain])
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -936,6 +1039,121 @@ class BaseModelRunner:
             lora_domains=lora_domains,
             outputs=outputs,
         )
+        self.capture_prefill_diffusion_cudagraph()
+
+    @torch.inference_mode()
+    def capture_prefill_diffusion_cudagraph(self) -> None:
+        make_dummy_inputs = getattr(self.model, "make_dummy_diffusion_inputs", None)
+        forward_diffusion = getattr(self.model, "forward_diffusion", None)
+        forward_backbone = getattr(self.model, "forward_backbone", None)
+        if not callable(make_dummy_inputs) or not callable(forward_diffusion) or not callable(forward_backbone):
+            return
+
+        max_bs = max(self.graph_bs)
+        inputs = make_dummy_inputs(max_bs)
+        cond = inputs["cond"]
+        outputs = torch.zeros(max_bs, self.patch_size, cond.size(1), dtype=cond.dtype, device=cond.device)
+        dit_rows_per_sample = self._dit_lora_rows_per_sample()
+        max_lora_buckets = self.max_loras + 1
+        graph_vars = {
+            "inputs": inputs,
+            "outputs": outputs,
+            "lora_domains": {
+                DIT_LORA_DOMAIN: self._make_graph_domain_buffers(
+                    dit_rows_per_sample * max_bs,
+                    max_lora_buckets,
+                )
+            },
+        }
+        self.prefill_diffusion_graphs = {"base": {}, "lora": {}}
+        capture_lora_graphs = bool(
+            self._config.lora_config is not None
+            and getattr(self._config.lora_config, "enable_dit", False)
+            and is_lora_available()
+        )
+
+        for bs in reversed(self.graph_bs):
+            dit_rows = dit_rows_per_sample * bs
+            base_context = build_lora_context_from_slot_list([-1] * dit_rows)
+            self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, base_context)
+            outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+
+            base_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(base_graph, self.graph_pool):
+                outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+            self.prefill_diffusion_graphs["base"][bs] = base_graph
+
+            if capture_lora_graphs:
+                lora_context = build_lora_context_from_slot_list([0] * dit_rows)
+                self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, lora_context)
+                outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+
+                lora_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(lora_graph, self.graph_pool):
+                    outputs[:bs] = forward_diffusion(**cut_inputs(inputs, bs))
+                self.prefill_diffusion_graphs["lora"][bs] = lora_graph
+
+            torch.cuda.synchronize()
+            reset_all_contexts()
+
+        self.prefill_diffusion_graph_vars = graph_vars
+
+    def _run_prefill_with_diffusion_graph(
+        self,
+        inputs: dict[str, torch.Tensor],
+        lora_contexts: dict[str, LoRAContext],
+    ):
+        diffusion_inputs, outputs = self.model.forward_backbone(**inputs)
+        batch_size = diffusion_inputs["mu"].size(0)
+        dit_context = lora_contexts[DIT_LORA_DOMAIN]
+
+        def run_diffusion_eager():
+            sequence_length = self._dit_lora_sequence_length()
+            token_to_slot = dit_context.token_to_slot
+            if not dit_context.no_lora_flag and token_to_slot is not None and sequence_length > 0:
+                rows_per_branch = token_to_slot.numel() // self.cfg_branches
+                padded_batch_size = rows_per_branch // sequence_length
+                if padded_batch_size > batch_size:
+                    real_rows_per_branch = batch_size * sequence_length
+                    token_to_slot = torch.cat(
+                        [
+                            token_to_slot[branch * rows_per_branch : branch * rows_per_branch + real_rows_per_branch]
+                            for branch in range(self.cfg_branches)
+                        ]
+                    )
+                    set_lora_context(
+                        build_lora_context_from_token_to_slot(token_to_slot),
+                        domain=DIT_LORA_DOMAIN,
+                    )
+            outputs["latents"] = self.model.forward_diffusion(**diffusion_inputs)
+            return outputs
+
+        z_noise = diffusion_inputs.get("z_noise")
+        if batch_size > self.graph_bs[-1] or z_noise is None:
+            return run_diffusion_eager()
+
+        has_active_dit_lora = (
+            not dit_context.no_lora_flag
+            and dit_context.token_to_slot is not None
+            and dit_context.token_to_slot.numel() > 0
+        )
+        graph_kind = "lora" if has_active_dit_lora else "base"
+        graphs = self.prefill_diffusion_graphs[graph_kind]
+        if not graphs:
+            return run_diffusion_eager()
+
+        graph_bs = next(bs for bs in self.graph_bs if bs >= batch_size)
+        graph_vars = self.prefill_diffusion_graph_vars
+        for name, value in diffusion_inputs.items():
+            buffer = graph_vars["inputs"][name]
+            buffer[:batch_size].copy_(value)
+            if batch_size < graph_bs:
+                buffer[batch_size:graph_bs].zero_()
+
+        self._set_graph_lora_context(graph_vars, DIT_LORA_DOMAIN, dit_context)
+        graphs[graph_bs].replay()
+        outputs["latents"] = graph_vars["outputs"][:batch_size]
+        return outputs
 
     @torch.inference_mode()
     def run_model(self, inputs: dict, is_prefill: bool):
@@ -945,6 +1163,13 @@ class BaseModelRunner:
         )
         has_lora_graph = has_active_lora and bool(getattr(self, "graphs", {}).get("lora"))
         try:
+            if (
+                is_prefill
+                and not self.enforce_eager
+                and hasattr(self, "prefill_diffusion_graphs")
+                and hasattr(self.model, "forward_backbone")
+            ):
+                return self._run_prefill_with_diffusion_graph(inputs, lora_contexts)
             if (
                 is_prefill
                 or self.enforce_eager
