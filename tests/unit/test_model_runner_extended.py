@@ -209,6 +209,21 @@ def test_dit_lora_rows_per_sample_with_dit_enabled():
     assert runner._dit_lora_rows_per_sample() == 40
 
 
+def test_expand_dit_lora_slots_uses_cfg_branch_major_order():
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    assert expand_dit_lora_slots([3, 7], sequence_length=2, cfg_branches=2) == [
+        3,
+        3,
+        7,
+        7,
+        3,
+        3,
+        7,
+        7,
+    ]
+
+
 @pytest.mark.gpu
 def test_build_lora_contexts_no_adapters_returns_empty_lm_and_no_lora_flags():
     import nanovllm_voxcpm.engine.model_runner as model_runner
@@ -879,7 +894,14 @@ def test_build_lora_contexts_with_active_adapter():
     from nanovllm_voxcpm.utils.context import LM_LORA_DOMAIN, PROJ_LORA_DOMAIN, DIT_LORA_DOMAIN
 
     runner = object.__new__(model_runner.BaseModelRunner)
-    runner.lora_config = None
+
+    class _FakeLoraCfg:
+        enable_dit = True
+
+    runner.lora_config = _FakeLoraCfg()
+    runner.cfg_branches = 2
+    runner.dit_lora_seq_len_offset = 0
+    runner.patch_size = 1
     runtime = LoRARuntime(max_loras=2, max_lora_rank=4)
     payload = LoRAModelPayload(modules={}, rank=1, alpha=1.0)
     runtime.register_lora("adapter_a", payload, adapter_id=3)
@@ -914,6 +936,7 @@ def test_build_lora_contexts_with_active_adapter():
     assert DIT_LORA_DOMAIN in contexts
     assert len(load_calls) == 1
     assert load_calls[0] == ([3, None], [2, 1])
+    assert contexts[DIT_LORA_DOMAIN].token_to_slot.tolist() == [0, 0, -1, -1, 0, 0, -1, -1]
 
 
 def test_load_lora_slot_unknown_module_raises():
