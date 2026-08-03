@@ -209,6 +209,52 @@ def test_dit_lora_rows_per_sample_with_dit_enabled():
     assert runner._dit_lora_rows_per_sample() == 40
 
 
+def test_expand_dit_lora_slots_uses_cfg_branch_major_order():
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    assert expand_dit_lora_slots([3, 7], sequence_length=2, cfg_branches=2) == [
+        3,
+        3,
+        7,
+        7,
+        3,
+        3,
+        7,
+        7,
+    ]
+
+
+def test_expand_dit_lora_slots_no_cross_voice_bleed_when_co_batched():
+    """Regression for PR #80: two distinct voices in one DiT batch must not
+    share adapters. Pre-fix sample-major expansion made sample B's cond rows
+    run under sample A's adapter, blending both voices.
+    """
+    from nanovllm_voxcpm.engine.model_runner import expand_dit_lora_slots
+
+    slot_a, slot_b = 3, 7
+    sample_to_slot = [slot_a, slot_b]
+    seq_len = 3
+    cfg_branches = 2
+
+    rows = expand_dit_lora_slots(sample_to_slot, sequence_length=seq_len, cfg_branches=cfg_branches)
+
+    assert len(rows) == cfg_branches * len(sample_to_slot) * seq_len
+
+    block = 0
+    for branch in range(cfg_branches):
+        for sample_idx, expected_slot in enumerate(sample_to_slot):
+            seq_rows = rows[block * seq_len : (block + 1) * seq_len]
+            assert seq_rows == [expected_slot] * seq_len, (
+                f"branch {branch} sample {sample_idx} rows {seq_rows} "
+                f"leaked another voice's adapter (expected all {expected_slot})"
+            )
+            block += 1
+
+    b_rows = [slot for slot in rows if slot == slot_b]
+    assert slot_a not in b_rows
+    assert b_rows == [slot_b] * (cfg_branches * seq_len)
+
+
 @pytest.mark.gpu
 def test_build_lora_contexts_no_adapters_returns_empty_lm_and_no_lora_flags():
     import nanovllm_voxcpm.engine.model_runner as model_runner
@@ -879,7 +925,14 @@ def test_build_lora_contexts_with_active_adapter():
     from nanovllm_voxcpm.utils.context import LM_LORA_DOMAIN, PROJ_LORA_DOMAIN, DIT_LORA_DOMAIN
 
     runner = object.__new__(model_runner.BaseModelRunner)
-    runner.lora_config = None
+
+    class _FakeLoraCfg:
+        enable_dit = True
+
+    runner.lora_config = _FakeLoraCfg()
+    runner.cfg_branches = 2
+    runner.dit_lora_seq_len_offset = 0
+    runner.patch_size = 1
     runtime = LoRARuntime(max_loras=2, max_lora_rank=4)
     payload = LoRAModelPayload(modules={}, rank=1, alpha=1.0)
     runtime.register_lora("adapter_a", payload, adapter_id=3)
@@ -914,6 +967,7 @@ def test_build_lora_contexts_with_active_adapter():
     assert DIT_LORA_DOMAIN in contexts
     assert len(load_calls) == 1
     assert load_calls[0] == ([3, None], [2, 1])
+    assert contexts[DIT_LORA_DOMAIN].token_to_slot.tolist() == [0, 0, -1, -1, 0, 0, -1, -1]
 
 
 def test_load_lora_slot_unknown_module_raises():

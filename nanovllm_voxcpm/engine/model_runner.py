@@ -171,6 +171,15 @@ def assign_outputs(inputs, outputs, bs):
         outputs[k][:bs] = inputs[k]
 
 
+def expand_dit_lora_slots(
+    sample_to_slot: list[int],
+    sequence_length: int,
+    cfg_branches: int,
+) -> list[int]:
+    """Expand sample slots in the branch-major order used by CFG."""
+    return [slot for _ in range(cfg_branches) for slot in sample_to_slot for _ in range(sequence_length)]
+
+
 def _clear_lora_slot_modules(modules, slot_id: int, module_names: list[str] | None = None) -> None:
     """Zero out LoRA weights for ``slot_id`` across ``modules``.
 
@@ -285,15 +294,17 @@ class BaseModelRunner:
     def run(self, seqs: list[RunnerTask], is_prefill: bool):
         raise NotImplementedError()
 
-    def _dit_lora_rows_per_sample(self) -> int:
+    def _dit_lora_sequence_length(self) -> int:
         lora_config = getattr(self, "lora_config", None)
         if not (lora_config and getattr(lora_config, "enable_dit", False)):
             return 0
-        return self.cfg_branches * (self.dit_lora_seq_len_offset + 2 * self.patch_size)
+        return self.dit_lora_seq_len_offset + 2 * self.patch_size
+
+    def _dit_lora_rows_per_sample(self) -> int:
+        return self.cfg_branches * self._dit_lora_sequence_length()
 
     def _build_lora_contexts(self, seqs: list[RunnerTask], token_counts: list[int]) -> dict[str, LoRAContext]:
         adapter_ids = [seq.adapter_id for seq in seqs]
-        dit_rows_per_sample = self._dit_lora_rows_per_sample()
         if not any(adapter_id is not None for adapter_id in adapter_ids):
             # No active LoRA anywhere in this batch. Build just the LM
             # ``token_to_slot=[-1,...]`` tensor; the PROJ and DIT domains can
@@ -316,7 +327,11 @@ class BaseModelRunner:
             LM_LORA_DOMAIN: build_lora_context_from_batch_plan(plan),
             PROJ_LORA_DOMAIN: build_lora_context_from_slot_list(sample_to_slot),
             DIT_LORA_DOMAIN: build_lora_context_from_slot_list(
-                [slot for slot in sample_to_slot for _ in range(dit_rows_per_sample)]
+                expand_dit_lora_slots(
+                    sample_to_slot,
+                    sequence_length=self._dit_lora_sequence_length(),
+                    cfg_branches=self.cfg_branches,
+                )
             ),
         }
 
