@@ -4,6 +4,7 @@ from multiprocessing.synchronize import Event
 
 import numpy as np
 import torch
+from torch.nn.utils import remove_weight_norm
 
 from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.engine.model_runner import BaseModelRunner, RunnerTask
@@ -29,6 +30,7 @@ class VoxCPM2Payload:
 class VoxCPM2Runner(BaseModelRunner):
     model: VoxCPM2Model
     dit_lora_seq_len_offset = 3
+    vae_dtype = torch.float16
 
     def __init__(
         self,
@@ -56,6 +58,10 @@ class VoxCPM2Runner(BaseModelRunner):
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
+        for module in self.vae.decoder.modules():
+            if hasattr(module, "weight_g"):
+                remove_weight_norm(module)
+        self.vae.decoder.to(dtype=self.vae_dtype)
         self.vae_streaming_decoder = self.vae.streaming_decoder()
         torch.set_default_dtype(torch.bfloat16)
 
@@ -146,16 +152,17 @@ class VoxCPM2Runner(BaseModelRunner):
                     None
                     if padding_decode is None
                     else torch.from_numpy(padding_decode)
-                    .to(device="cuda", dtype=torch.float32, non_blocking=True)
+                    .to(device="cuda", dtype=self.vae_dtype, non_blocking=True)
                     .transpose(0, 1)
                     .unsqueeze(0)
                 )
             vae_decoder_outputs = (
                 self.vae_streaming_decoder.decode_chunks(
-                    latents.to(torch.float32).permute(0, 2, 1),
+                    latents.to(self.vae_dtype).permute(0, 2, 1),
                     [seq.seq_id for seq in seqs],
                     initial_contexts,
                 )[:, 0, :]
+                .to(torch.float32)
                 .cpu()
                 .numpy()
             )
@@ -170,7 +177,7 @@ class VoxCPM2Runner(BaseModelRunner):
                 len(seqs),
                 max_pad_decode,
                 self.feat_dim,
-                dtype=torch.float32,
+                dtype=self.vae_dtype,
                 device="cuda",
             )
             for i, seq in enumerate(seqs):
@@ -179,8 +186,11 @@ class VoxCPM2Runner(BaseModelRunner):
                     vae_decoder_inputs[i, :pad_len] = torch.from_numpy(seq.custom_payload.padding_decode).cuda(
                         non_blocking=True
                     )
-                vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(torch.float32)
-            vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :].cpu().numpy()
+                vae_decoder_inputs[i, pad_len : pad_len + self.patch_size] = latents[i].to(self.vae_dtype)
+            vae_decoder_outputs = self.vae.decode(vae_decoder_inputs.permute(0, 2, 1))[:, 0, :]
+            if isinstance(vae_decoder_outputs, torch.Tensor):
+                vae_decoder_outputs = vae_decoder_outputs.to(torch.float32)
+            vae_decoder_outputs = vae_decoder_outputs.cpu().numpy()
             ret_waveforms = []
             for i, pad_len in enumerate(pad_lengths):
                 ret_waveforms.append(
