@@ -1116,7 +1116,7 @@ class BaseModelRunner:
                 )
             },
         }
-        self.prefill_diffusion_graphs = {"base": {}, "lora": {}}
+        self.prefill_diffusion_graphs: dict[str, dict[int, torch.cuda.CUDAGraph]] = {"base": {}, "lora": {}}
         capture_lora_graphs = bool(
             self._config.lora_config is not None
             and getattr(self._config.lora_config, "enable_dit", False)
@@ -1154,7 +1154,10 @@ class BaseModelRunner:
         inputs: dict[str, torch.Tensor],
         lora_contexts: dict[str, LoRAContext],
     ):
-        diffusion_inputs, outputs = self.model.forward_backbone(**inputs)
+        forward_backbone = getattr(self.model, "forward_backbone", None)
+        if not callable(forward_backbone):
+            raise RuntimeError("diffusion graph replay requires model.forward_backbone")
+        diffusion_inputs, outputs = forward_backbone(**inputs)
         batch_size = diffusion_inputs["mu"].size(0)
         dit_context = lora_contexts[DIT_LORA_DOMAIN]
 
