@@ -813,6 +813,8 @@ def test_make_graph_domain_buffers_shapes():
 
     assert (buffers["token_to_slot"] == -1).all()
     assert buffers["active_slot_ids"].tolist() == [-1, 0, 1]
+    assert "host_staging" not in buffers
+    assert "copy_event" not in buffers
 
 
 def test_write_shm_inline_small_payload():

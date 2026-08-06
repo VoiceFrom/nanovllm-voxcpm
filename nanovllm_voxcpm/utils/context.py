@@ -37,6 +37,12 @@ class LoRAContext:
     # the model. Cleared by ``set_lora_context`` (i.e. fresh each step).
     _cached_metadata: object | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def token_count(self) -> int:
+        if self.token_to_slot is not None:
+            return self.token_to_slot.numel()
+        return len(self.host_token_to_slot or ())
+
 
 @dataclass
 class LoRAContexts:

@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 
 
-def compare_waveforms(actual: np.ndarray, reference: np.ndarray) -> dict[str, float | int]:
+def compare_waveforms(actual: np.ndarray, reference: np.ndarray) -> dict[str, float | int | bool]:
+    if actual.size == 0 or reference.size == 0:
+        raise ValueError("waveform comparison requires non-empty actual and reference arrays")
     common_samples = min(actual.size, reference.size)
     actual_common = actual[:common_samples].astype(np.float64)
     reference_common = reference[:common_samples].astype(np.float64)
@@ -16,11 +18,15 @@ def compare_waveforms(actual: np.ndarray, reference: np.ndarray) -> dict[str, fl
     centered_actual = actual_common - float(actual_common.mean())
     centered_reference = reference_common - float(reference_common.mean())
     denominator = np.linalg.norm(centered_actual) * np.linalg.norm(centered_reference)
-    correlation = float(np.dot(centered_actual, centered_reference) / denominator) if denominator else 1.0
+    if denominator:
+        correlation = float(np.dot(centered_actual, centered_reference) / denominator)
+    else:
+        correlation = 1.0 if np.array_equal(actual_common, reference_common) else 0.0
     return {
         "actual_samples": int(actual.size),
         "reference_samples": int(reference.size),
         "common_samples": common_samples,
+        "length_match": actual.size == reference.size,
         "rmse": float(np.sqrt(np.mean(error**2))),
         "abs_error_p99_9": float(np.percentile(np.abs(error), 99.9)),
         "max_abs_error": float(np.max(np.abs(error))),
@@ -28,13 +34,35 @@ def compare_waveforms(actual: np.ndarray, reference: np.ndarray) -> dict[str, fl
     }
 
 
+def comparison_failures(
+    comparison: dict[str, float | int | bool],
+    *,
+    require_same_length: bool,
+    max_rmse: float | None,
+    max_abs_error: float | None,
+    min_correlation: float | None,
+) -> list[str]:
+    failures = []
+    if require_same_length and not comparison["length_match"]:
+        failures.append(
+            f"sample count mismatch: actual={comparison['actual_samples']} reference={comparison['reference_samples']}"
+        )
+    if max_rmse is not None and comparison["rmse"] > max_rmse:
+        failures.append(f"rmse {comparison['rmse']:.6g} exceeds {max_rmse:.6g}")
+    if max_abs_error is not None and comparison["max_abs_error"] > max_abs_error:
+        failures.append(f"max_abs_error {comparison['max_abs_error']:.6g} exceeds {max_abs_error:.6g}")
+    if min_correlation is not None and comparison["correlation"] < min_correlation:
+        failures.append(f"correlation {comparison['correlation']:.9g} is below {min_correlation:.9g}")
+    return failures
+
+
 async def async_main(args: argparse.Namespace) -> None:
     from nanovllm_voxcpm import VoxCPM
 
+    if args.concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
     target_text = (
-        Path(args.target_text_file).read_text(encoding="utf-8").strip()
-        if args.target_text_file
-        else args.target_text
+        Path(args.target_text_file).read_text(encoding="utf-8").strip() if args.target_text_file else args.target_text
     )
     server_pool = VoxCPM.from_pretrained(
         model=args.model,
@@ -46,6 +74,7 @@ async def async_main(args: argparse.Namespace) -> None:
         devices=[args.device],
         enforce_eager=args.enforce_eager,
     )
+
     async def generate_one(seed: int) -> np.ndarray:
         chunks = []
         async for chunk in server_pool.generate(
@@ -72,16 +101,32 @@ async def async_main(args: argparse.Namespace) -> None:
         "output": str(Path(args.output).resolve()),
         "num_samples": [int(waveform.size) for waveform in waveforms],
     }
+    failures = []
     if args.reference:
         reference = np.load(args.reference)
         if args.concurrency == 1:
-            result["comparison"] = compare_waveforms(waveforms[0], reference)
+            comparisons = [compare_waveforms(waveforms[0], reference)]
+            result["comparison"] = comparisons[0]
         else:
-            result["comparison"] = [
-                compare_waveforms(waveform, reference[f"request_{index}"])
-                for index, waveform in enumerate(waveforms)
+            comparisons = [
+                compare_waveforms(waveform, reference[f"request_{index}"]) for index, waveform in enumerate(waveforms)
             ]
+            result["comparison"] = comparisons
+        for index, comparison in enumerate(comparisons):
+            request_failures = comparison_failures(
+                comparison,
+                require_same_length=not args.allow_length_mismatch,
+                max_rmse=args.max_rmse,
+                max_abs_error=args.max_abs_error,
+                min_correlation=args.min_correlation,
+            )
+            failures.extend(f"request_{index}: {failure}" for failure in request_failures)
+        result["comparison_passed"] = not failures
+        if failures:
+            result["failures"] = failures
     print(json.dumps(result, indent=2, sort_keys=True))
+    if failures:
+        raise SystemExit(1)
 
 
 def main() -> None:
@@ -99,6 +144,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--allow-length-mismatch", action="store_true")
+    parser.add_argument("--max-rmse", type=float)
+    parser.add_argument("--max-abs-error", type=float)
+    parser.add_argument("--min-correlation", type=float)
     asyncio.run(async_main(parser.parse_args()))
 
 

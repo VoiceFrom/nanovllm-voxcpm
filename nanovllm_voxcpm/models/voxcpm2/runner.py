@@ -58,12 +58,16 @@ class VoxCPM2Runner(BaseModelRunner):
         self.vae = AudioVAEV2(config=model_config.audio_vae_config)
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
+        self._prepare_vae_decoder_for_inference()
+        self.vae_streaming_decoder = self.vae.streaming_decoder()
+        torch.set_default_dtype(torch.bfloat16)
+
+    def _prepare_vae_decoder_for_inference(self) -> None:
+        """Fold weight norm and cast only the inference decoder to FP16."""
         for module in self.vae.decoder.modules():
             if hasattr(module, "weight_g"):
                 remove_weight_norm(module)
         self.vae.decoder.to(dtype=self.vae_dtype)
-        self.vae_streaming_decoder = self.vae.streaming_decoder()
-        torch.set_default_dtype(torch.bfloat16)
 
     def make_dummy_inputs(self, batch_size: int, length: int) -> dict[str, torch.Tensor]:
         return {

@@ -87,6 +87,7 @@ from nanovllm_voxcpm.engine.lora_manager import (
     LoRARuntime,
     build_lora_context_from_batch_plan,
     build_lora_context_from_slot_list,
+    materialize_lora_context,
 )
 from nanovllm_voxcpm.layers.attention import Attention
 from nanovllm_voxcpm.layers.lora import iter_lora_modules
@@ -317,7 +318,15 @@ class BaseModelRunner:
     def _dit_lora_rows_per_sample(self) -> int:
         return self.cfg_branches * self._dit_lora_sequence_length()
 
-    def _build_lora_contexts(self, seqs: list[RunnerTask], token_counts: list[int]) -> dict[str, LoRAContext]:
+    def _build_lora_contexts(
+        self,
+        seqs: list[RunnerTask],
+        token_counts: list[int],
+        *,
+        materialize_domains: set[str] | None = None,
+    ) -> dict[str, LoRAContext]:
+        if materialize_domains is None:
+            materialize_domains = set(LORA_DOMAINS)
         adapter_ids = [seq.adapter_id for seq in seqs]
         if not any(adapter_id is not None for adapter_id in adapter_ids):
             # No active LoRA anywhere in this batch. Build just the LM
@@ -328,7 +337,10 @@ class BaseModelRunner:
             # tensor.
             empty_ctx = LoRAContext(no_lora_flag=True, num_active_loras=0)
             return {
-                LM_LORA_DOMAIN: build_lora_context_from_slot_list([-1] * sum(token_counts)),
+                LM_LORA_DOMAIN: build_lora_context_from_slot_list(
+                    [-1] * sum(token_counts),
+                    materialize_device=LM_LORA_DOMAIN in materialize_domains,
+                ),
                 PROJ_LORA_DOMAIN: empty_ctx,
                 DIT_LORA_DOMAIN: empty_ctx,
             }
@@ -350,9 +362,18 @@ class BaseModelRunner:
             padded_batch_size=padded_batch_size,
         )
         return {
-            LM_LORA_DOMAIN: build_lora_context_from_batch_plan(plan),
-            PROJ_LORA_DOMAIN: build_lora_context_from_slot_list(sample_to_slot),
-            DIT_LORA_DOMAIN: build_lora_context_from_slot_list(dit_token_to_slot),
+            LM_LORA_DOMAIN: build_lora_context_from_batch_plan(
+                plan,
+                materialize_device=LM_LORA_DOMAIN in materialize_domains,
+            ),
+            PROJ_LORA_DOMAIN: build_lora_context_from_slot_list(
+                sample_to_slot,
+                materialize_device=PROJ_LORA_DOMAIN in materialize_domains,
+            ),
+            DIT_LORA_DOMAIN: build_lora_context_from_slot_list(
+                dit_token_to_slot,
+                materialize_device=DIT_LORA_DOMAIN in materialize_domains,
+            ),
         }
 
     def _lora_model_modules(self) -> dict[str, torch.nn.Module]:
@@ -734,7 +755,17 @@ class BaseModelRunner:
             block_tables,
         )
         token_counts = [seq.seq_length - seq.num_cached_tokens for seq in seqs]
-        for domain, lora_context in self._build_lora_contexts(seqs, token_counts).items():
+        use_diffusion_graph = (
+            not getattr(self, "enforce_eager", True)
+            and hasattr(self, "prefill_diffusion_graphs")
+            and hasattr(self.model, "forward_backbone")
+        )
+        materialize_domains = {LM_LORA_DOMAIN, PROJ_LORA_DOMAIN} if use_diffusion_graph else set(LORA_DOMAINS)
+        for domain, lora_context in self._build_lora_contexts(
+            seqs,
+            token_counts,
+            materialize_domains=materialize_domains,
+        ).items():
             set_lora_context(lora_context, domain=domain)
         return positions
 
@@ -756,7 +787,12 @@ class BaseModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
         )
-        for domain, lora_context in self._build_lora_contexts(seqs, [1 for _ in seqs]).items():
+        materialize_domains = set(LORA_DOMAINS) if getattr(self, "enforce_eager", True) else set()
+        for domain, lora_context in self._build_lora_contexts(
+            seqs,
+            [1 for _ in seqs],
+            materialize_domains=materialize_domains,
+        ).items():
             set_lora_context(lora_context, domain=domain)
         return positions
 
@@ -770,7 +806,10 @@ class BaseModelRunner:
         )
         total_size = sum(sizes)
         packed = torch.empty(total_size, dtype=torch.int32)
-        host_staging = torch.empty(total_size, dtype=torch.int32, device="cpu", pin_memory=True)
+        is_cuda_buffer = packed.device.type == "cuda"
+        host_staging = (
+            torch.empty(total_size, dtype=torch.int32, device="cpu", pin_memory=True) if is_cuda_buffer else packed
+        )
         offsets = [0]
         for size in sizes:
             offsets.append(offsets[-1] + size)
@@ -793,23 +832,29 @@ class BaseModelRunner:
         host_active_slot_ids.copy_(torch.arange(-1, max_lora_buckets - 1, dtype=torch.int32))
         host_num_tokens.zero_()
         host_slot_offsets.zero_()
-        packed.copy_(host_staging, non_blocking=True)
-        return {
+
+        buffers = {
             "packed": packed,
-            "host_staging": host_staging,
-            "copy_event": torch.cuda.Event(),
-            "copy_pending": False,
             "token_to_slot": token_to_slot,
             "token_indices_sorted_by_slot": token_indices,
             "active_slot_ids": active_slot_ids,
             "num_tokens_per_slot": num_tokens,
             "slot_start_offsets": slot_offsets,
-            "host_token_to_slot": host_token_to_slot,
-            "host_token_indices_sorted_by_slot": host_token_indices,
-            "host_active_slot_ids": host_active_slot_ids,
-            "host_num_tokens_per_slot": host_num_tokens,
-            "host_slot_start_offsets": host_slot_offsets,
         }
+        if is_cuda_buffer:
+            buffers.update(
+                {
+                    "host_staging": host_staging,
+                    "copy_event": torch.cuda.Event(),
+                    "copy_pending": False,
+                    "host_token_to_slot": host_token_to_slot,
+                    "host_token_indices_sorted_by_slot": host_token_indices,
+                    "host_active_slot_ids": host_active_slot_ids,
+                    "host_num_tokens_per_slot": host_num_tokens,
+                    "host_slot_start_offsets": host_slot_offsets,
+                }
+            )
+        return buffers
 
     def _copy_lora_domain_to_graph_vars(
         self,
@@ -836,7 +881,7 @@ class BaseModelRunner:
         num_tokens_buf: torch.Tensor = domain_vars["num_tokens_per_slot"]
         slot_start_buf: torch.Tensor = domain_vars["slot_start_offsets"]
 
-        token_count = 0 if context.token_to_slot is None else context.token_to_slot.size(0)
+        token_count = context.token_count
         has_host_metadata = context.host_token_to_slot is not None
         if "host_staging" in domain_vars and (context.no_lora_flag or has_host_metadata):
             if domain_vars["copy_pending"]:
@@ -915,7 +960,7 @@ class BaseModelRunner:
     def _set_graph_lora_context(self, graph_vars: dict, domain: str, context: LoRAContext) -> None:
         self._copy_lora_domain_to_graph_vars(graph_vars, domain, context)
         domain_vars = graph_vars["lora_domains"][domain]
-        token_count = 0 if context.token_to_slot is None else context.token_to_slot.size(0)
+        token_count = context.token_count
         num_lora_buckets = domain_vars["active_slot_ids"].size(0)
         set_lora_context(
             LoRAContext(
@@ -933,6 +978,12 @@ class BaseModelRunner:
     def _set_graph_lora_contexts(self, graph_vars: dict, contexts: dict[str, LoRAContext]) -> None:
         for domain in LORA_DOMAINS:
             self._set_graph_lora_context(graph_vars, domain, contexts[domain])
+
+    def _materialize_lora_contexts(self, contexts: dict[str, LoRAContext]) -> None:
+        for domain, context in contexts.items():
+            materialized = materialize_lora_context(context)
+            contexts[domain] = materialized
+            set_lora_context(materialized, domain=domain)
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -1108,9 +1159,11 @@ class BaseModelRunner:
         dit_context = lora_contexts[DIT_LORA_DOMAIN]
 
         def run_diffusion_eager():
+            eager_dit_context = materialize_lora_context(dit_context)
+            set_lora_context(eager_dit_context, domain=DIT_LORA_DOMAIN)
             sequence_length = self._dit_lora_sequence_length()
-            token_to_slot = dit_context.token_to_slot
-            if not dit_context.no_lora_flag and token_to_slot is not None and sequence_length > 0:
+            token_to_slot = eager_dit_context.token_to_slot
+            if not eager_dit_context.no_lora_flag and token_to_slot is not None and sequence_length > 0:
                 rows_per_branch = token_to_slot.numel() // self.cfg_branches
                 padded_batch_size = rows_per_branch // sequence_length
                 if padded_batch_size > batch_size:
@@ -1132,11 +1185,7 @@ class BaseModelRunner:
         if batch_size > self.graph_bs[-1] or z_noise is None:
             return run_diffusion_eager()
 
-        has_active_dit_lora = (
-            not dit_context.no_lora_flag
-            and dit_context.token_to_slot is not None
-            and dit_context.token_to_slot.numel() > 0
-        )
+        has_active_dit_lora = not dit_context.no_lora_flag and dit_context.token_count > 0
         graph_kind = "lora" if has_active_dit_lora else "base"
         graphs = self.prefill_diffusion_graphs[graph_kind]
         if not graphs:
@@ -1159,7 +1208,7 @@ class BaseModelRunner:
     def run_model(self, inputs: dict, is_prefill: bool):
         lora_contexts = {domain: get_lora_context(domain) for domain in LORA_DOMAINS}
         has_active_lora = any(
-            not context.no_lora_flag and context.token_to_slot is not None for context in lora_contexts.values()
+            not context.no_lora_flag and context.token_count > 0 for context in lora_contexts.values()
         )
         has_lora_graph = has_active_lora and bool(getattr(self, "graphs", {}).get("lora"))
         try:
@@ -1176,6 +1225,7 @@ class BaseModelRunner:
                 or inputs["positions"].size(0) > 512
                 or (has_active_lora and not has_lora_graph)
             ):
+                self._materialize_lora_contexts(lora_contexts)
                 return self.model(**inputs)
 
             bs = inputs["positions"].size(0)
