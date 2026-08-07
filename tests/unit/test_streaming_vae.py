@@ -226,3 +226,159 @@ def test_streaming_vae_failed_decode_does_not_advance_state():
     actual = decoder.decode_chunks(chunk, ["request"])
 
     torch.testing.assert_close(actual, reference_vae.decode(chunk))
+
+
+def _build_multistage_vae(causal_conv, causal_transpose_conv):
+    """A deep causal decoder that chains dilated convs with multiple strided upsamplers.
+
+    This exercises whether per-layer streaming state retains the *full* receptive
+    field across a multi-stage stack (initial conv, dilated residual convs, and
+    two transpose-conv upsamplers), not just the single-stage TinyVAE above.
+    """
+
+    class MultiStageVAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = nn.Sequential(
+                causal_conv(2, 8, kernel_size=7, padding=3),
+                nn.SiLU(),
+                causal_transpose_conv(8, 8, kernel_size=4, stride=2, padding=1),
+                causal_conv(8, 8, kernel_size=3, padding=2, dilation=2),
+                nn.SiLU(),
+                causal_transpose_conv(8, 4, kernel_size=8, stride=4, padding=2),
+                causal_conv(4, 1, kernel_size=7, padding=3),
+            )
+
+        def decode(self, z):
+            return self.decoder(z)
+
+    return MultiStageVAE()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "nanovllm_voxcpm.layers.audio_vae",
+        "nanovllm_voxcpm.layers.audio_vae_v2",
+    ],
+)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")),
+    ],
+)
+def test_streaming_vae_matches_full_decode_across_deep_multistage_stack(module_name, device):
+    module = __import__(module_name, fromlist=["CausalConv1d", "CausalTransposeConv1d"])
+    causal_conv = module.CausalConv1d
+    causal_transpose_conv = module.CausalTransposeConv1d
+
+    torch.manual_seed(5)
+    streaming_vae = _build_multistage_vae(causal_conv, causal_transpose_conv).to(device)
+    reference_vae = copy.deepcopy(streaming_vae)
+    decoder = BatchedStreamingVAEDecoder(streaming_vae, causal_conv, causal_transpose_conv)
+
+    chunks = [torch.randn(1, 2, 4, device=device) for _ in range(5)]
+    expected = reference_vae.decode(torch.cat(chunks, dim=-1))
+
+    streamed = torch.cat([decoder.decode_chunks(chunk, ["stream"]) for chunk in chunks], dim=-1)
+
+    torch.testing.assert_close(streamed, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")),
+    ],
+)
+def test_streaming_vae_primes_multistage_context_matches_full_decode(device):
+    from nanovllm_voxcpm.layers.audio_vae import CausalConv1d, CausalTransposeConv1d
+
+    torch.manual_seed(6)
+    streaming_vae = _build_multistage_vae(CausalConv1d, CausalTransposeConv1d).to(device)
+    reference_vae = copy.deepcopy(streaming_vae)
+    decoder = BatchedStreamingVAEDecoder(streaming_vae, CausalConv1d, CausalTransposeConv1d)
+
+    prime = torch.randn(1, 2, 4, device=device)
+    gen_chunks = [torch.randn(1, 2, 4, device=device) for _ in range(3)]
+    expected = reference_vae.decode(torch.cat([prime, *gen_chunks], dim=-1))
+
+    streamed = torch.cat(
+        [
+            decoder.decode_chunks(chunk, ["stream"], [prime] if index == 0 else [None])
+            for index, chunk in enumerate(gen_chunks)
+        ],
+        dim=-1,
+    )
+
+    post_prime_reference = expected[..., -streamed.size(-1) :]
+    torch.testing.assert_close(streamed, post_prime_reference, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("kernel_size", "stride"),
+    [
+        (6, 2),
+        (8, 4),
+        pytest.param(
+            5,
+            2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="context = kernel // stride - 1 under-retains when stride does not divide kernel",
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")),
+    ],
+)
+def test_streaming_vae_transpose_conv_matches_full_decode_for_non_double_stride(kernel_size, stride, device):
+    """Lock the streaming-context formula for transpose convs where kernel != 2 * stride.
+
+    Shipped decoders hard-code ``kernel_size = 2 * stride``, so ``context = kernel //
+    stride - 1`` always equals the true required context and streaming stays exact.
+    Divisible ratios such as (6, 2) and (8, 4) must therefore match a full decode; the
+    xfail (5, 2) case documents that a non-divisible ratio under-retains context under
+    the current formula, guarding against silently relying on that unsupported config.
+    """
+    from nanovllm_voxcpm.layers.audio_vae import CausalConv1d, CausalTransposeConv1d
+
+    padding = (kernel_size - stride + 1) // 2
+    output_padding = (2 * padding + stride - kernel_size) % stride
+
+    class TinyTransposeVAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = nn.Sequential(
+                CausalTransposeConv1d(
+                    2,
+                    1,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                    output_padding=output_padding,
+                ),
+            )
+
+        def decode(self, z):
+            return self.decoder(z)
+
+    torch.manual_seed(7)
+    streaming_vae = TinyTransposeVAE().to(device)
+    reference_vae = copy.deepcopy(streaming_vae)
+    decoder = BatchedStreamingVAEDecoder(streaming_vae, CausalConv1d, CausalTransposeConv1d)
+
+    chunks = [torch.randn(1, 2, 3, device=device) for _ in range(4)]
+    expected = reference_vae.decode(torch.cat(chunks, dim=-1))
+
+    streamed = torch.cat([decoder.decode_chunks(chunk, ["stream"]) for chunk in chunks], dim=-1)
+
+    torch.testing.assert_close(streamed, expected, rtol=1e-5, atol=1e-6)
