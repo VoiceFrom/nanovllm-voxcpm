@@ -347,8 +347,13 @@ class AudioVAE(nn.Module):
         """
         return self.decoder(z)
 
-    def streaming_decoder(self) -> BatchedStreamingVAEDecoder:
-        return BatchedStreamingVAEDecoder(self, CausalConv1d, CausalTransposeConv1d)
+    def streaming_decoder(self, max_batch_size: int | None = None) -> BatchedStreamingVAEDecoder:
+        return BatchedStreamingVAEDecoder(
+            self,
+            CausalConv1d,
+            CausalTransposeConv1d,
+            max_batch_size=max_batch_size,
+        )
 
     @torch.inference_mode()
     def encode(self, audio_data: torch.Tensor, sample_rate: int):

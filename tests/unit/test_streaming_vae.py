@@ -58,6 +58,67 @@ def test_streaming_vae_matches_full_decode_with_dynamic_batch_order(module_name,
     torch.testing.assert_close(actual_b, expected_b, rtol=1e-5, atol=1e-6)
 
 
+def test_streaming_vae_pads_to_fixed_batch_bucket_and_cleans_dummy_state():
+    from nanovllm_voxcpm.layers.audio_vae import CausalConv1d, CausalTransposeConv1d
+
+    class TinyVAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = nn.Sequential(CausalConv1d(1, 1, kernel_size=3, padding=1))
+            self.seen_batch_sizes = []
+
+        def decode(self, z):
+            self.seen_batch_sizes.append(z.size(0))
+            return self.decoder(z)
+
+    torch.manual_seed(4)
+    vae = TinyVAE()
+    reference_vae = copy.deepcopy(vae)
+    decoder = BatchedStreamingVAEDecoder(
+        vae,
+        CausalConv1d,
+        CausalTransposeConv1d,
+        max_batch_size=4,
+    )
+    chunks = torch.randn(3, 1, 2)
+    stream_ids = ["a", "b", "c"]
+
+    actual = decoder.decode_chunks(chunks, stream_ids)
+
+    torch.testing.assert_close(actual, reference_vae.decode(chunks))
+    assert vae.seen_batch_sizes == [4]
+    for layer_states in decoder._states.values():
+        assert set(layer_states) == set(stream_ids)
+
+
+def test_streaming_vae_warmup_initializes_all_buckets_without_retaining_state():
+    from nanovllm_voxcpm.layers.audio_vae import CausalConv1d, CausalTransposeConv1d
+
+    class TinyVAE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = nn.Sequential(CausalConv1d(1, 1, kernel_size=3, padding=1))
+            self.seen_batch_sizes = []
+
+        def decode(self, z):
+            self.seen_batch_sizes.append(z.size(0))
+            return self.decoder(z)
+
+    vae = TinyVAE()
+    decoder = BatchedStreamingVAEDecoder(
+        vae,
+        CausalConv1d,
+        CausalTransposeConv1d,
+        max_batch_size=4,
+    )
+
+    decoder.warmup(latent_channels=1, chunk_size=2)
+
+    assert vae.seen_batch_sizes == [1, 2, 4]
+    assert not decoder._initialized_streams
+    assert all(not layer_states for layer_states in decoder._states.values())
+
+
 def test_streaming_vae_primes_context_once_and_releases_state():
     from nanovllm_voxcpm.layers.audio_vae import CausalConv1d, CausalTransposeConv1d
 

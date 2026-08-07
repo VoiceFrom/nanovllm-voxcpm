@@ -59,7 +59,8 @@ class VoxCPM2Runner(BaseModelRunner):
         vae_state_dict = torch.load(os.path.join(model_path, "audiovae.pth"))["state_dict"]
         self.vae.load_state_dict(vae_state_dict)
         self._prepare_vae_decoder_for_inference()
-        self.vae_streaming_decoder = self.vae.streaming_decoder()
+        self.vae_streaming_decoder = self.vae.streaming_decoder(self._config.max_num_seqs)
+        self.vae_streaming_decoder.warmup(self.feat_dim, self.patch_size)
         torch.set_default_dtype(torch.bfloat16)
 
     def _prepare_vae_decoder_for_inference(self) -> None:

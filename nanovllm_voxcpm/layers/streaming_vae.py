@@ -12,14 +12,30 @@ class BatchedStreamingVAEDecoder:
         vae: nn.Module,
         causal_conv_type: type[nn.Conv1d],
         causal_transpose_conv_type: type[nn.ConvTranspose1d],
+        max_batch_size: int | None = None,
     ):
+        if max_batch_size is not None and max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
         self._vae = vae
         self._causal_conv_type = causal_conv_type
         self._causal_transpose_conv_type = causal_transpose_conv_type
+        self._batch_size_buckets = self._make_batch_size_buckets(max_batch_size)
         self._states: dict[int, dict[Hashable, torch.Tensor]] = {}
         self._stream_ids: Sequence[Hashable] | None = None
         self._initialized_streams: set[Hashable] = set()
         self._install()
+
+    @staticmethod
+    def _make_batch_size_buckets(max_batch_size: int | None) -> tuple[int, ...]:
+        if max_batch_size is None:
+            return ()
+        buckets = []
+        batch_size = 1
+        while batch_size < max_batch_size:
+            buckets.append(batch_size)
+            batch_size *= 2
+        buckets.append(max_batch_size)
+        return tuple(buckets)
 
     @torch.inference_mode()
     def decode_chunks(
@@ -56,7 +72,7 @@ class BatchedStreamingVAEDecoder:
                     self._decode(context, [stream_id])
                 self._initialized_streams.add(stream_id)
 
-            return self._decode(z_chunks, stream_ids)
+            return self._decode_bucketed(z_chunks, stream_ids)
         except Exception:
             for layer_id, layer_states in self._states.items():
                 for stream_id, state in state_snapshot[layer_id].items():
@@ -67,6 +83,31 @@ class BatchedStreamingVAEDecoder:
             self._initialized_streams.difference_update(stream_ids)
             self._initialized_streams.update(initialized_snapshot)
             raise
+
+    @torch.inference_mode()
+    def warmup(self, latent_channels: int, chunk_size: int) -> None:
+        """Initialize decoder kernels for every configured batch-size bucket."""
+        if not self._batch_size_buckets:
+            return
+        if self._initialized_streams or any(self._states.values()):
+            raise RuntimeError("streaming VAE warmup requires empty stream state")
+
+        parameter = next(self._vae.decoder.parameters(), None)
+        if parameter is None:
+            raise RuntimeError("streaming VAE decoder has no parameters")
+        for batch_size in self._batch_size_buckets:
+            z_chunks = torch.zeros(
+                batch_size,
+                latent_channels,
+                chunk_size,
+                device=parameter.device,
+                dtype=parameter.dtype,
+            )
+            stream_ids = [object() for _ in range(batch_size)]
+            self.decode_chunks(z_chunks, stream_ids)
+            self.clear()
+        if parameter.device.type == "cuda":
+            torch.cuda.synchronize(parameter.device)
 
     def release(self, stream_id: Hashable) -> None:
         """Release all cached convolution state for a completed request."""
@@ -87,6 +128,28 @@ class BatchedStreamingVAEDecoder:
             return self._vae.decode(z_chunks)
         finally:
             self._stream_ids = None
+
+    def _decode_bucketed(self, z_chunks: torch.Tensor, stream_ids: Sequence[Hashable]) -> torch.Tensor:
+        batch_size = z_chunks.size(0)
+        padded_batch_size = next(
+            (bucket for bucket in self._batch_size_buckets if bucket >= batch_size),
+            batch_size,
+        )
+        if padded_batch_size == batch_size:
+            return self._decode(z_chunks, stream_ids)
+
+        num_padding = padded_batch_size - batch_size
+        padding = z_chunks.new_zeros((num_padding, *z_chunks.shape[1:]))
+        dummy_stream_ids = [object() for _ in range(num_padding)]
+        try:
+            output = self._decode(
+                torch.cat([z_chunks, padding], dim=0),
+                [*stream_ids, *dummy_stream_ids],
+            )
+            return output[:batch_size]
+        finally:
+            for stream_id in dummy_stream_ids:
+                self.release(stream_id)
 
     def _install(self) -> None:
         for module in self._vae.decoder.modules():
