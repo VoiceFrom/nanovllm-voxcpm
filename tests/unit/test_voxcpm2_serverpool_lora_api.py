@@ -29,6 +29,7 @@ class _FakeServer:
         lora_name=None,
         seed=42,
         return_latents=False,
+        seq_id=None,
     ):
         self.generate_calls.append(
             {"lora_name": lora_name, "ref_audio_latents": ref_audio_latents, "cfg_value": cfg_value, "seed": seed}
@@ -50,6 +51,7 @@ async def _exercise_async_server_pool_register_list_generate_and_unregister():
     pool._prompt_pool = {}
     pool._registered_loras = set()
     pool._draining_loras = set()
+    pool._active_seq = {}
 
     await pool.register_lora("demo", "/tmp/demo")
     assert await pool.list_loras() == [{"name": "demo"}]
@@ -77,6 +79,7 @@ async def _exercise_async_server_pool_rejects_unknown_lora_name():
     pool._prompt_pool = {}
     pool._registered_loras = set()
     pool._draining_loras = set()
+    pool._active_seq = {}
 
     with pytest.raises(ValueError, match="not registered"):
         async for _ in pool.generate("hello", lora_name="missing"):
@@ -98,6 +101,7 @@ async def _exercise_async_server_pool_unregister_partial_failure_enters_draining
     pool._prompt_pool = {}
     pool._registered_loras = {"demo"}
     pool._draining_loras = set()
+    pool._active_seq = {}
 
     with pytest.raises(RuntimeError, match="boom"):
         await pool.unregister_lora("demo")

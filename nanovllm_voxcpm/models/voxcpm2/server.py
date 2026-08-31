@@ -450,8 +450,9 @@ class AsyncVoxCPM2Server:
         lora_name: str | None = None,
         seed: int | None = None,
         return_latents: bool = False,
+        seq_id: str | None = None,
     ) -> AsyncGenerator[Waveform | tuple[Waveform, bytes], None]:
-        seq_id = gen_uuid()
+        seq_id = seq_id or gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
         is_normal_exit = False
         try:
@@ -480,6 +481,18 @@ class AsyncVoxCPM2Server:
                 await self.submit("cancel", seq_id)
             del self.stream_table[seq_id]
 
+    async def cancel(self, seq_id: str) -> None:
+        """Cancel a running request out of band; unknown ids are a no-op.
+
+        The engine drops the sequence at the next step boundary; a consumer
+        blocked on the stream is unblocked with the terminal sentinel, so
+        its generator finishes as a normal exit.
+        """
+        await self.submit("cancel", seq_id)
+        stream = self.stream_table.get(seq_id)
+        if stream is not None:
+            await stream.put(None)
+
 
 class AsyncVoxCPM2ServerPool:
     def __init__(
@@ -497,6 +510,7 @@ class AsyncVoxCPM2ServerPool:
     ):
         if len(kwargs) > 0:
             raise ValueError(f"Unknown kwargs: {kwargs}")
+        self._active_seq: dict[str, AsyncVoxCPM2Server] = {}
         self.servers = [
             AsyncVoxCPM2Server(
                 model_path=model_path,
@@ -588,6 +602,7 @@ class AsyncVoxCPM2ServerPool:
         lora_name: str | None = None,
         seed: int | None = None,
         return_latents: bool = False,
+        seq_id: str | None = None,
     ):
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:
@@ -603,9 +618,11 @@ class AsyncVoxCPM2ServerPool:
         if lora_name is not None and (lora_name not in self._registered_loras or lora_name in self._draining_loras):
             raise ValueError(f"LoRA '{lora_name}' is not registered")
 
+        seq_id = seq_id or gen_uuid()
         min_load_server_idx = np.argmin(self.servers_load)
         self.servers_load[min_load_server_idx] += 1
         server = self.servers[min_load_server_idx]
+        self._active_seq[seq_id] = server
         try:
             async for data in server.generate(
                 target_text,
@@ -618,10 +635,21 @@ class AsyncVoxCPM2ServerPool:
                 lora_name,
                 seed,
                 return_latents,
+                seq_id,
             ):
                 yield data
         finally:
+            self._active_seq.pop(seq_id, None)
             self.servers_load[min_load_server_idx] -= 1
+
+    async def cancel(self, seq_id: str) -> None:
+        """Cancel a running request by the id given to `generate`.
+
+        A no-op when the id is unknown or the request already finished.
+        """
+        server = self._active_seq.get(seq_id)
+        if server is not None:
+            await server.cancel(seq_id)
 
 
 class SyncVoxCPM2ServerPool:
