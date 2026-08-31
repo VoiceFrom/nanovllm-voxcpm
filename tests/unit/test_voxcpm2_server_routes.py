@@ -62,12 +62,14 @@ class _FakeServer:
         ref_audio_latents=None,
         lora_name=None,
         seed=42,
+        return_latents=False,
     ):
         self.generate_calls.append(
             {
                 "target_text": target_text,
                 "lora_name": lora_name,
                 "ref_audio_latents": ref_audio_latents,
+                "return_latents": return_latents,
             }
         )
         yield "chunk"
@@ -742,3 +744,96 @@ async def _async_server_generate_cancels_when_consumer_closes_early():
 
 def test_async_server_generate_cancels_when_consumer_closes_early():
     asyncio.run(_async_server_generate_cancels_when_consumer_closes_early())
+
+
+# ---------------------------------------------------------------------------
+# return_latents threading
+# ---------------------------------------------------------------------------
+
+
+def test_add_request_return_latents_defaults_off():
+    srv = _make_server_impl()
+    srv.add_request("seq1", "hello")
+    assert srv.llm.added_requests[0]["return_latents"] is False
+
+
+def test_add_request_forwards_return_latents_on_both_branches():
+    srv = _make_server_impl(feat_dim=4)
+    srv.add_request("seq1", "hello", return_latents=True)
+    lat = np.ones((2, 4), dtype=np.float32).tobytes()
+    srv.add_request("seq2", "hello", prompt_latents=lat, prompt_text="p", return_latents=True)
+    assert [req["return_latents"] for req in srv.llm.added_requests] == [True, True]
+
+
+def test_stream_data_waveform_only_by_default():
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm.models.voxcpm2.server import _stream_data
+
+    wave = np.array([0.5], dtype=np.float32)
+    seq = SimpleNamespace(
+        seq_id="s1",
+        custom_payload=SimpleNamespace(
+            generated_waveforms=[wave],
+            feats=[np.ones((1, 1, 4), dtype=np.float32)],
+            return_latents=False,
+        ),
+    )
+    assert _stream_data(seq) is wave
+
+
+def test_stream_data_pairs_latent_bytes_when_requested():
+    from types import SimpleNamespace
+
+    from nanovllm_voxcpm.models.voxcpm2.server import _stream_data
+
+    wave = np.array([0.5], dtype=np.float32)
+    patch = np.ones((1, 1, 4), dtype=np.float32)
+    seq = SimpleNamespace(
+        seq_id="s1",
+        custom_payload=SimpleNamespace(generated_waveforms=[wave], feats=[patch], return_latents=True),
+    )
+    data = _stream_data(seq)
+    assert isinstance(data, tuple)
+    assert data[0] is wave
+    assert np.frombuffer(data[1], dtype=np.float32).reshape(1, 1, 4).tolist() == patch.tolist()
+
+
+async def _async_server_generate_threads_return_latents():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server.stream_table = {}
+    seen = []
+
+    async def submit(command, *args):
+        seen.append((command, args))
+        if command == "add_request":
+            stream = server.stream_table[args[0]]
+            await stream.put((np.array([1.0], dtype=np.float32), b"\x00" * 16))
+            await stream.put(None)
+
+    server.submit = submit
+    chunks = [chunk async for chunk in server.generate("hello", return_latents=True)]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], tuple)
+    command, args = seen[0]
+    assert command == "add_request"
+    assert args[-1] is True  # return_latents rides last in the submit args
+
+
+def test_async_server_generate_threads_return_latents():
+    asyncio.run(_async_server_generate_threads_return_latents())
+
+
+async def _pool_generate_forwards_return_latents():
+    srv = _FakeServer()
+    pool = _make_pool([srv])
+    chunks = [chunk async for chunk in pool.generate("hi", return_latents=True)]
+    assert chunks == ["chunk"]
+    assert srv.generate_calls[0]["return_latents"] is True
+
+
+def test_pool_generate_forwards_return_latents():
+    asyncio.run(_pool_generate_forwards_return_latents())

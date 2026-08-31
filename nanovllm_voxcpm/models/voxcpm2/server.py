@@ -125,6 +125,7 @@ class VoxCPM2ServerImpl:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        return_latents: bool = False,
     ) -> None:
 
         if prompt_latents is None:
@@ -144,6 +145,7 @@ class VoxCPM2ServerImpl:
                 cfg_value=cfg_value,
                 lora_name=lora_name,
                 seed=seed,
+                return_latents=return_latents,
             )
             return
 
@@ -166,6 +168,7 @@ class VoxCPM2ServerImpl:
             cfg_value=cfg_value,
             lora_name=lora_name,
             seed=seed,
+            return_latents=return_latents,
         )
 
     def register_lora(self, name: str, path: str) -> RegisterLoRAResponse:
@@ -187,6 +190,15 @@ class VoxCPM2ServerImpl:
 
     def is_finished(self):
         return self.llm.is_finished()
+
+
+def _stream_data(seq):
+    """The per-step stream payload: the newest waveform, paired with the
+    newest latent patch as float32 bytes when the request asked for it."""
+    latest_waveform = seq.custom_payload.generated_waveforms[-1]
+    if seq.custom_payload.return_latents:
+        return (latest_waveform, seq.custom_payload.feats[-1].tobytes())
+    return latest_waveform
 
 
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
@@ -252,8 +264,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
 
             output = srv.step()
             for seq in output:
-                latest_waveform = seq.custom_payload.generated_waveforms[-1]
-                queue_out.put({"type": "stream", "id": seq.seq_id, "data": latest_waveform})
+                queue_out.put({"type": "stream", "id": seq.seq_id, "data": _stream_data(seq)})
                 if seq.is_finished:
                     queue_out.put({"type": "stream", "id": seq.seq_id, "data": None})
 
@@ -438,7 +449,8 @@ class AsyncVoxCPM2Server:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
-    ) -> AsyncGenerator[Waveform, None]:
+        return_latents: bool = False,
+    ) -> AsyncGenerator[Waveform | tuple[Waveform, bytes], None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
         is_normal_exit = False
@@ -455,6 +467,7 @@ class AsyncVoxCPM2Server:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                return_latents,
             )
             while True:
                 data = await self.stream_table[seq_id].get()
@@ -574,6 +587,7 @@ class AsyncVoxCPM2ServerPool:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        return_latents: bool = False,
     ):
         if prompt_id is not None:
             if prompt_id not in self._prompt_pool:
@@ -603,6 +617,7 @@ class AsyncVoxCPM2ServerPool:
                 ref_audio_latents,
                 lora_name,
                 seed,
+                return_latents,
             ):
                 yield data
         finally:
@@ -687,6 +702,7 @@ class SyncVoxCPM2ServerPool:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
+        return_latents: bool = False,
     ):
         assert self.loop is not None
         async_gen = self.server_pool.generate(
@@ -700,6 +716,7 @@ class SyncVoxCPM2ServerPool:
             ref_audio_latents,
             lora_name,
             seed,
+            return_latents,
         )
         try:
             while True:

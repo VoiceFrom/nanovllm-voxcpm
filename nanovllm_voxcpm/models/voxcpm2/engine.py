@@ -25,6 +25,7 @@ class VoxCPM2SeqPayload:
     max_generate_length: int | None = None
     seed: int | None = None
     seed_step: int = 0
+    return_latents: bool = False
 
 
 class VoxCPM2Engine(LLMEngineBase):
@@ -130,6 +131,7 @@ class VoxCPM2Engine(LLMEngineBase):
         cfg_value: float = 1.0,
         lora_name: str | None = None,
         seed: int | None = None,
+        return_latents: bool = False,
     ):
         if max_generate_length < 1:
             raise ValueError(f"max_generate_length must be >= 1, got {max_generate_length}")
@@ -202,6 +204,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 generated_waveforms=[],
                 seed=seed,
                 seed_step=0,
+                return_latents=return_latents,
             ),
             lora_name=lora_name,
             adapter_id=adapter_id,
