@@ -27,6 +27,7 @@ class _FakeServer:
         self.unregistered: list[str] = []
         self.generate_calls: list[dict] = []
         self.encode_calls: list[tuple[bytes, str]] = []
+        self.cancelled: list[str] = []
 
     async def register_lora(self, name: str, path: str):
         self.registered.append((name, path))
@@ -63,6 +64,7 @@ class _FakeServer:
         lora_name=None,
         seed=42,
         return_latents=False,
+        seq_id=None,
     ):
         self.generate_calls.append(
             {
@@ -70,9 +72,13 @@ class _FakeServer:
                 "lora_name": lora_name,
                 "ref_audio_latents": ref_audio_latents,
                 "return_latents": return_latents,
+                "seq_id": seq_id,
             }
         )
         yield "chunk"
+
+    async def cancel(self, seq_id):
+        self.cancelled.append(seq_id)
 
 
 class _FailRegisterServer(_FakeServer):
@@ -99,6 +105,7 @@ def _make_pool(servers):
     pool._prompt_pool = {}
     pool._registered_loras = set()
     pool._draining_loras = set()
+    pool._active_seq = {}
     return pool
 
 
@@ -837,3 +844,89 @@ async def _pool_generate_forwards_return_latents():
 
 def test_pool_generate_forwards_return_latents():
     asyncio.run(_pool_generate_forwards_return_latents())
+
+
+# ---------------------------------------------------------------------------
+# out-of-band cancel
+# ---------------------------------------------------------------------------
+
+
+async def _async_server_generate_uses_caller_seq_id():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server.stream_table = {}
+    seen = []
+
+    async def submit(command, *args):
+        seen.append((command, args))
+        if command == "add_request":
+            stream = server.stream_table[args[0]]
+            await stream.put(np.array([1.0], dtype=np.float32))
+            await stream.put(None)
+
+    server.submit = submit
+    chunks = [chunk async for chunk in server.generate("hello", seq_id="my-id")]
+
+    assert len(chunks) == 1
+    assert seen[0][1][0] == "my-id"
+
+
+def test_async_server_generate_uses_caller_seq_id():
+    asyncio.run(_async_server_generate_uses_caller_seq_id())
+
+
+async def _async_server_cancel_unblocks_blocked_consumer():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server.stream_table = {}
+    commands = []
+
+    async def submit(command, *args):
+        commands.append(command)  # add_request puts nothing: consumer blocks
+
+    server.submit = submit
+
+    async def consume():
+        return [chunk async for chunk in server.generate("hello", seq_id="s1")]
+
+    task = asyncio.create_task(consume())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await server.cancel("s1")
+    chunks = await asyncio.wait_for(task, timeout=2)
+
+    assert chunks == []
+    assert commands == ["add_request", "cancel"]
+    assert server.stream_table == {}
+
+
+def test_async_server_cancel_unblocks_blocked_consumer():
+    asyncio.run(_async_server_cancel_unblocks_blocked_consumer())
+
+
+async def _pool_generate_registers_and_clears_active_seq():
+    srv = _FakeServer()
+    pool = _make_pool([srv])
+    chunks = [chunk async for chunk in pool.generate("hi", seq_id="sid-1")]
+    assert chunks == ["chunk"]
+    assert srv.generate_calls[0]["seq_id"] == "sid-1"
+    assert pool._active_seq == {}
+
+
+def test_pool_generate_registers_and_clears_active_seq():
+    asyncio.run(_pool_generate_registers_and_clears_active_seq())
+
+
+async def _pool_cancel_routes_to_owning_server_and_ignores_unknown():
+    srv = _FakeServer()
+    pool = _make_pool([srv])
+    pool._active_seq["sid-2"] = srv
+    await pool.cancel("sid-2")
+    await pool.cancel("nope")
+    assert srv.cancelled == ["sid-2"]
+
+
+def test_pool_cancel_routes_to_owning_server_and_ignores_unknown():
+    asyncio.run(_pool_cancel_routes_to_owning_server_and_ignores_unknown())
