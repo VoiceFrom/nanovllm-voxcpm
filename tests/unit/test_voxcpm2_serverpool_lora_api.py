@@ -28,6 +28,7 @@ class _FakeServer:
         ref_audio_latents=None,
         lora_name=None,
         seed=42,
+        return_latents=False,
     ):
         self.generate_calls.append(
             {"lora_name": lora_name, "ref_audio_latents": ref_audio_latents, "cfg_value": cfg_value, "seed": seed}
